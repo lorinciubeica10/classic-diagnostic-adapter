@@ -156,7 +156,11 @@ impl<S: SecurityPlugin> PayloadDecoder for EcuManager<S> {
                 }
             }
 
-            let raw_uds_payload = {
+            let raw_uds_payload = if response_type == datatypes::ResponseType::Negative
+                || response_type == datatypes::ResponseType::GlobalNegative
+            {
+                payload.data.clone()
+            } else {
                 let base_offset = params
                     .iter()
                     .filter(|p| {
@@ -166,11 +170,14 @@ impl<S: SecurityPlugin> PayloadDecoder for EcuManager<S> {
                     .map(datatypes::Parameter::byte_position)
                     .min()
                     .unwrap_or(0);
-                uds_payload.data()?.get(base_offset as usize..).ok_or(
-                    DiagServiceError::BadPayload("Payload offset out of bounds".to_owned()),
-                )?
-            }
-            .to_vec();
+                uds_payload
+                    .data()?
+                    .get(base_offset as usize..)
+                    .ok_or(DiagServiceError::BadPayload(
+                        "Payload offset out of bounds".to_owned(),
+                    ))?
+                    .to_vec()
+            };
 
             if response_type == datatypes::ResponseType::Positive && !map_to_json {
                 return Ok(DiagServiceResponseStruct {
@@ -400,7 +407,7 @@ impl<S: SecurityPlugin> EcuManager<S> {
                 self.map_param_length_key_from_uds(mapped_service, uds_payload, data, param_ctx)?;
             }
             datatypes::ParamType::NrcConst => {
-                tracing::error!("NrcConst ParamType not implemented.");
+                map_param_nrc_const_from_uds(param_name, uds_payload, data, param_ctx)?;
             }
             datatypes::ParamType::PhysConst => {
                 self.map_param_phys_const_from_uds(
@@ -1821,6 +1828,35 @@ fn map_param_coded_const_from_uds(
         param_name.to_owned(),
         DiagDataTypeContainer::RawContainer(value),
     );
+    Ok(())
+}
+
+fn map_param_nrc_const_from_uds(
+    param_name: &str,
+    uds_payload: &mut Payload,
+    data: &mut MappedDiagServiceResponsePayload,
+    param_ctx: ParamContext<'_>,
+) -> Result<(), DiagServiceError> {
+    let nrc_const = param_ctx.parameter.specific_data_as_nrc_const().ok_or(
+        DiagServiceError::InvalidDatabase("Expected NrcConst specific data".to_owned()),
+    )?;
+    let diag_type: datatypes::DiagCodedType = nrc_const
+        .diag_coded_type()
+        .map(TryInto::try_into)
+        .transpose()?
+        .ok_or(DiagServiceError::InvalidDatabase(
+            "Expected DiagCodedType in NrcConst specific data".to_owned(),
+        ))?;
+    let value = operations::extract_diag_data_container(
+        param_ctx.parameter.short_name(),
+        param_ctx.abs_byte_pos(),
+        param_ctx.parameter.bit_position() as usize,
+        uds_payload,
+        &diag_type,
+        None,
+    )?;
+
+    data.insert(param_name.to_owned(), value);
     Ok(())
 }
 

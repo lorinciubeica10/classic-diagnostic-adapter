@@ -95,55 +95,27 @@ impl DiagServiceResponse for DiagServiceResponseStruct {
     }
 
     fn as_nrc(&self) -> Result<MappedNRC, DiagServiceError> {
-        let Some(MappedResponseData {
-            data: mapped_data,
-            errors: _,
-        }) = &self.mapped_data
-        else {
-            return extract_nrc_from_raw_data(&self.data);
-        };
-        let nrc_code = mapped_data
-            .get("NRC")
-            .and_then(|container| match container {
-                DiagDataTypeContainer::RawContainer(nrc) => {
-                    let raw = u8::from_be(*nrc.data.first()?);
-                    let message = match operations::uds_data_to_serializable(
-                        nrc.data_type,
-                        nrc.compu_method.as_ref(),
-                        true,
-                        &nrc.data,
-                    )
-                    .unwrap_or_else(|_| DiagDataValue::String("Unknown".to_owned()))
-                    {
-                        DiagDataValue::String(v) => v,
-                        _ => "N/A".to_owned(),
-                    };
-                    Some((raw, message))
-                }
-                _ => None,
-            });
-        let sid = mapped_data
-            .get("SIDRQ_NR")
-            .and_then(|container| match container {
-                DiagDataTypeContainer::RawContainer(sid) => {
-                    sid.data.first().map(|&b| u8::from_be(b))
-                }
-                _ => None,
+        if let Some(mapped_data) = &self.mapped_data
+            && let Some(DiagDataTypeContainer::RawContainer(nrc)) = mapped_data.data.get("NRC")
+            && let Some(&code) = nrc.data.first()
+        {
+            let sid = mapped_data.data.get("SIDRQ_NR").and_then(|container| {
+                let DiagDataTypeContainer::RawContainer(sid) = container else {
+                    return None;
+                };
+                sid.data.first().copied()
             });
 
-        if let Some((code, description)) = nrc_code {
-            Ok(MappedNRC {
-                code: Some(code),
-                description: Some(description),
-                sid,
-            })
-        } else {
-            Ok(MappedNRC {
-                code: None,
-                description: None,
-                sid,
-            })
+            if sid.is_some() {
+                return Ok(MappedNRC {
+                    code: Some(code),
+                    description: Some(iso_14229_nrc::get_nrc_code(code).to_string()),
+                    sid,
+                });
+            }
         }
+
+        extract_nrc_from_raw_data(&self.data)
     }
 
     fn is_empty(&self) -> bool {
@@ -424,6 +396,94 @@ mod tests {
             Some("Security Access Denied".to_string())
         );
     }
+
+    #[test]
+    fn test_as_nrc_falls_back_to_raw_negative_response() {
+        let response = DiagServiceResponseStruct {
+            service: DiagComm::new("ReadDataByIdentifier", cda_interfaces::DiagCommType::Data),
+            data: vec![0x7F, 0x22, 0x33],
+            mapped_data: Some(MappedResponseData {
+                data: HashMap::new(),
+                errors: Vec::new(),
+            }),
+            response_type: DiagServiceResponseType::Negative,
+        };
+
+        let result = response.as_nrc().unwrap();
+
+        assert_eq!(result.code, Some(0x33));
+        assert_eq!(result.sid, Some(0x22));
+        assert_eq!(
+            result.description,
+            Some("Security Access Denied".to_string())
+        );
+    }
+
+    #[test]
+    fn test_as_nrc_uses_mapped_nrc() {
+        let raw_container = |data| {
+            DiagDataTypeContainer::RawContainer(DiagDataTypeContainerRaw {
+                data,
+                bit_len: 8,
+                data_type: DataType::UInt32,
+                compu_method: None,
+            })
+        };
+        let mut mapped_data = HashMap::new();
+        mapped_data.insert("NRC".to_owned(), raw_container(vec![0x33]));
+        mapped_data.insert("SIDRQ_NR".to_owned(), raw_container(vec![0x22]));
+        let response = DiagServiceResponseStruct {
+            service: DiagComm::new("ReadDataByIdentifier", cda_interfaces::DiagCommType::Data),
+            data: vec![0x7F, 0x22, 0x33],
+            mapped_data: Some(MappedResponseData {
+                data: mapped_data,
+                errors: Vec::new(),
+            }),
+            response_type: DiagServiceResponseType::Negative,
+        };
+
+        let result = response.as_nrc().unwrap();
+
+        assert_eq!(result.code, Some(0x33));
+        assert_eq!(result.sid, Some(0x22));
+        assert_eq!(
+            result.description,
+            Some("Security Access Denied".to_string())
+        );
+    }
+
+    #[test]
+    fn test_as_nrc_requires_sid_when_using_mapped_nrc() {
+        let raw_container = |data| {
+            DiagDataTypeContainer::RawContainer(DiagDataTypeContainerRaw {
+                data,
+                bit_len: 8,
+                data_type: DataType::UInt32,
+                compu_method: None,
+            })
+        };
+        let mut mapped_data = HashMap::new();
+        mapped_data.insert("NRC".to_owned(), raw_container(vec![0x33]));
+        let response = DiagServiceResponseStruct {
+            service: DiagComm::new("ReadDataByIdentifier", cda_interfaces::DiagCommType::Data),
+            data: vec![0x7F, 0x22, 0x33],
+            mapped_data: Some(MappedResponseData {
+                data: mapped_data,
+                errors: Vec::new(),
+            }),
+            response_type: DiagServiceResponseType::Negative,
+        };
+
+        let result = response.as_nrc().unwrap();
+
+        assert_eq!(result.code, Some(0x33));
+        assert_eq!(result.sid, Some(0x22));
+        assert_eq!(
+            result.description,
+            Some("Security Access Denied".to_string())
+        );
+    }
+
     #[test]
     fn test_extract_nrc_from_raw_data_too_short() {
         // Test with data that's too short
