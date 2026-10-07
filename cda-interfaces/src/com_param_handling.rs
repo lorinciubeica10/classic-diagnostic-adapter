@@ -89,4 +89,12 @@ pub trait CanComParamProvider: Send + Sync + 'static {
     /// Functional CAN ID for broadcast requests
     #[must_use]
     fn can_functional_id(&self) -> Option<crate::CanId>;
+
+    /// Tester present payload for the functional broadcast keep-alive
+    /// (`CP_TesterPresentMessage`), sent as-is.
+    /// `None` when neither the database nor a config override (`precedence =
+    /// "Config"`) provides one; the com-param default is not used here, so the
+    /// gateway can tell a configured payload from the fallback.
+    #[must_use]
+    fn can_keepalive_message(&self) -> Option<Vec<u8>>;
 }

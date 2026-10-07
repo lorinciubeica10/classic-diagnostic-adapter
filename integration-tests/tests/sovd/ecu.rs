@@ -228,15 +228,6 @@ async fn test_can_only_ecu_from_configuration() {
 #[allow(clippy::too_many_lines, reason = "Makes sense to keep test together")]
 #[tokio::test]
 async fn test_ecu_session_switching() {
-    // TODO(can): SecurityAccess seed/key/lock sequencing is not yet reliable
-    // over the CAN transport. Re-enable once the CAN session/security path
-    // is hardened, see #444
-    if skip_for_can(
-        "test_ecu_session_switching",
-        "SecurityAccess sequencing not yet supported over CAN",
-    ) {
-        return;
-    }
     let (runtime, _lock) = setup_integration_test(true).await.unwrap();
     let auth = auth_header(&runtime.config, None).await.unwrap();
     let ecu_endpoint = sovd::ECU_FLXC1000_ENDPOINT;
@@ -466,13 +457,6 @@ async fn test_ecu_session_switching() {
 /// simulator rejects the seed request unless it receives the configured byte.
 #[tokio::test]
 async fn request_seed_forwards_parameters_to_fsnr2000() {
-    if skip_for_can(
-        "request_seed_forwards_parameters_to_fsnr2000",
-        "SecurityAccess sequencing not yet supported over CAN",
-    ) {
-        return;
-    }
-
     let (runtime, _lock) = setup_integration_test(true)
         .await
         .expect("integration test runtime should start");
@@ -577,12 +561,6 @@ async fn request_seed_forwards_parameters_to_fsnr2000() {
 
 #[tokio::test]
 async fn send_key_rejects_request_seed_parameters() {
-    if skip_for_can(
-        "send_key_rejects_request_seed_parameters",
-        "SecurityAccess sequencing not yet supported over CAN",
-    ) {
-        return;
-    }
     let (runtime, _lock) = setup_integration_test(true).await.unwrap();
     let auth = auth_header(&runtime.config, None)
         .await
@@ -1097,15 +1075,6 @@ async fn test_boot_variant_service_inheritance() {
 
 #[tokio::test]
 async fn test_ecu_session_reset_on_lock_reacquire() {
-    // TODO(can): session expiry depends on TesterPresent keepalive cadence,
-    // which is not yet reliable over the CAN transport (per-transaction
-    // sockets + busy-poll dispatcher are too slow), see #444
-    if skip_for_can(
-        "test_ecu_session_reset_on_lock_reacquire",
-        "session-expiry keepalive timing not yet reliable over CAN",
-    ) {
-        return;
-    }
     let (runtime, _lock) = setup_integration_test(true).await.unwrap();
     let auth = auth_header(&runtime.config, None).await.unwrap();
     let ecu_endpoint = sovd::ECU_FLXC1000_ENDPOINT;

@@ -19,8 +19,8 @@ use cda_interfaces::{
     HashMapExtensions, HashSet, PayloadDecoder, Protocol, VariantState,
     datatypes::{
         AddressingMode, ComParamConfig, ComParamPrecedence, ComParamValue, ComParams,
-        ComplexComParamValue, DatabaseNamingConvention, DiagnosticServiceAffixPosition,
-        RetryPolicy, SdSdg, TesterPresentSendType,
+        ComplexComParamValue, DatabaseNamingConvention, DeserializableCompParam,
+        DiagnosticServiceAffixPosition, RetryPolicy, SdSdg, TesterPresentSendType,
     },
     dlt_ctx,
     util::std_ext,
@@ -97,6 +97,8 @@ pub struct EcuManager<S: SecurityPlugin> {
     /// when `Some`, both IDs are present and range-validated.
     pub(in crate::diag_kernel) can_ids: Option<cda_interfaces::CanIds>,
     pub(in crate::diag_kernel) can_functional_id: Option<cda_interfaces::CanId>,
+    /// See [`Self::resolve_keepalive_message`] for the resolution order.
+    pub(in crate::diag_kernel) can_keepalive_message: Option<Vec<u8>>,
 
     pub(in crate::diag_kernel) nack_number_of_retries: HashMap<u8, u32>,
     pub(in crate::diag_kernel) diagnostic_ack_timeout: Duration,
@@ -199,6 +201,10 @@ impl<S: SecurityPlugin> cda_interfaces::CanComParamProvider for EcuManager<S> {
 
     fn can_functional_id(&self) -> Option<cda_interfaces::CanId> {
         self.can_functional_id
+    }
+
+    fn can_keepalive_message(&self) -> Option<Vec<u8>> {
+        self.can_keepalive_message.clone()
     }
 }
 
@@ -468,6 +474,50 @@ impl<S: SecurityPlugin> EcuManager<S> {
             })
     }
 
+    /// Resolves the CAN keep-alive payload with the precedence
+    /// config override (`precedence = "Config"`) > database value > `None`.
+    /// Unlike `find_com_param`, a missing entry does not fall back to the
+    /// com-param default, so the CAN gateway can apply its own fallback.
+    fn resolve_keepalive_message(
+        database: &datatypes::DiagnosticDatabase,
+        data_protocol: Option<&datatypes::Protocol<'_>>,
+        config: &ComParamConfig<Vec<u8>>,
+    ) -> Option<Vec<u8>> {
+        if config.precedence == ComParamPrecedence::Config {
+            tracing::debug!(
+                param_name = %config.name,
+                "Using config value (precedence = Config), DB lookup skipped"
+            );
+            return Some(config.value.clone()).filter(|message| !message.is_empty());
+        }
+
+        match datatypes::lookup(database, data_protocol.map(|v| &**v), &config.name) {
+            Ok(ComParamValue::Simple(simple)) => {
+                Vec::<u8>::parse_from_db(&simple.value, simple.unit.as_ref())
+                    .inspect_err(|e| {
+                        tracing::warn!(
+                            param_name = %config.name,
+                            param_value = %simple.value,
+                            error = %e,
+                            "Invalid tester present message in MDD com-params, treating as absent"
+                        );
+                    })
+                    .ok()
+                    .filter(|message| !message.is_empty())
+            }
+            Ok(ComParamValue::Complex(_)) => {
+                tracing::warn!(
+                    param_name = %config.name,
+                    "Tester present message is a complex com-param, expected a simple value; \
+                     treating as absent"
+                );
+                None
+            }
+            // Most commonly NotFound (the database does not define it).
+            Err(_) => None,
+        }
+    }
+
     /// Resolve a logical address, keeping track of whether it was actually
     /// resolved (config override or database hit) as opposed to falling back
     /// to the com-param default.
@@ -672,6 +722,11 @@ impl<S: SecurityPlugin> EcuManager<S> {
                 })
                 .ok()
         });
+        let can_keepalive_message = Self::resolve_keepalive_message(
+            &database,
+            data_protocol_ref,
+            &com_params.uds.tester_present_message,
+        );
 
         let ecu_name = database
             .ecu_data()?
@@ -693,6 +748,7 @@ impl<S: SecurityPlugin> EcuManager<S> {
                 && !logical_ecu_address.is_comparam_default,
             can_ids,
             can_functional_id,
+            can_keepalive_message,
             nack_number_of_retries,
             diagnostic_ack_timeout: database
                 .find_com_param(data_protocol_ref, &com_params.doip.diagnostic_ack_timeout)?,
@@ -819,6 +875,12 @@ impl<S: SecurityPlugin> EcuManager<S> {
                 .functional_id
                 .value
                 .and_then(|id| cda_interfaces::CanId::try_from(id).ok()),
+            // No database lookup for functional descriptions; only a config
+            // override applies.
+            can_keepalive_message: (com_params.uds.tester_present_message.precedence
+                == ComParamPrecedence::Config)
+                .then(|| com_params.uds.tester_present_message.value.clone())
+                .filter(|message| !message.is_empty()),
             nack_number_of_retries,
             diagnostic_ack_timeout: com_params.doip.diagnostic_ack_timeout.value,
             retry_period: com_params.doip.retry_period.value,

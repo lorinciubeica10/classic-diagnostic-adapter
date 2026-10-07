@@ -85,6 +85,9 @@ pub struct CanDiagGateway {
     functional_id: CanId,
     /// Configured keepalive interval. Zero disables keepalive.
     keepalive_interval: Duration,
+    /// `TesterPresent` payload for the keepalive broadcast, see
+    /// [`Self::resolve_keepalive_payload`].
+    keepalive_payload: Vec<u8>,
     /// Notifies variant detection after discovery and rediscovery.
     variant_detection: VariantDetectionSender,
     /// Shared restartable lifecycle state and retained task configuration.
@@ -224,6 +227,18 @@ impl CanDiagGateway {
             return Err(CanGatewaySetupError::NoEcuMappings);
         }
 
+        // Only ECUs on this CAN bus contribute to the keep-alive payload; in
+        // mixed mode the map also holds DoIP ECUs.
+        let mut keepalive_candidates = Vec::new();
+        for ecu_name in connections.keys() {
+            if let Some(ecu_lock) = ecus.get(ecu_name)
+                && let Some(message) = ecu_lock.read().await.can_keepalive_message()
+            {
+                keepalive_candidates.push((ecu_name.clone(), message));
+            }
+        }
+        let keepalive_payload = Self::resolve_keepalive_payload(keepalive_candidates);
+
         let gateway = Self {
             interface: config.interface.clone(),
             connections: Arc::new(connections),
@@ -236,11 +251,44 @@ impl CanDiagGateway {
             probe_sequence: Arc::new(probe_sequence),
             functional_id,
             keepalive_interval: Duration::from_millis(config.keepalive_interval_ms),
+            keepalive_payload,
             variant_detection,
             lifecycle: Arc::new(GatewayLifecycle::new(TransportState::Disabled)),
         };
 
         Ok(gateway)
+    }
+
+    /// Picks the keep-alive payload from the ECUs' `CP_TesterPresentMessage`
+    /// com-params (`(ecu_name, message)` pairs), falling back to
+    /// [`keepalive::DEFAULT_KEEPALIVE_PAYLOAD`] when none defines one.
+    ///
+    /// One broadcast serves the whole bus, so when ECUs disagree (e.g. UDS
+    /// and KWP2000 ECUs on the same bus) the first ECU by name wins and the
+    /// conflict is logged.
+    fn resolve_keepalive_payload(mut candidates: Vec<(String, Vec<u8>)>) -> Vec<u8> {
+        candidates.sort();
+        let Some((chosen_ecu, payload)) = candidates.first() else {
+            return keepalive::DEFAULT_KEEPALIVE_PAYLOAD.to_vec();
+        };
+        for (ecu, message) in candidates.iter().skip(1) {
+            if message != payload {
+                tracing::warn!(
+                    chosen_ecu = %chosen_ecu,
+                    chosen_payload = %hex::encode(payload),
+                    ecu = %ecu,
+                    ecu_payload = %hex::encode(message),
+                    "ECUs on the CAN bus define different tester present messages; the \
+                     keep-alive broadcast can only use one"
+                );
+            }
+        }
+        tracing::info!(
+            ecu = %chosen_ecu,
+            payload = %hex::encode(payload),
+            "Using keep-alive payload from MDD com-params"
+        );
+        payload.clone()
     }
 
     /// Adds connections for ECUs whose CAN addressing comes from the MDD
@@ -804,6 +852,7 @@ impl TransportControl for CanDiagGateway {
                 self.interface.clone(),
                 self.functional_id,
                 self.keepalive_interval,
+                self.keepalive_payload.clone(),
             ));
         }
 
@@ -859,6 +908,7 @@ impl Clone for CanDiagGateway {
             probe_sequence: Arc::clone(&self.probe_sequence),
             functional_id: self.functional_id,
             keepalive_interval: self.keepalive_interval,
+            keepalive_payload: self.keepalive_payload.clone(),
             variant_detection: self.variant_detection.clone(),
             lifecycle: Arc::clone(&self.lifecycle),
         }
@@ -897,6 +947,7 @@ impl CanDiagGateway {
             probe_sequence: Arc::new(vec![ProbeRequest::tester_present()]),
             functional_id: CanId::try_from(0x7DF).expect("valid test CAN ID"),
             keepalive_interval: Duration::ZERO,
+            keepalive_payload: keepalive::DEFAULT_KEEPALIVE_PAYLOAD.to_vec(),
             variant_detection: VariantDetectionSender::new(mpsc::channel(1).0),
             lifecycle: Arc::new(GatewayLifecycle::new(TransportState::Enabled)),
         }
@@ -933,5 +984,38 @@ mod tests {
         assert!(CanDiagGateway::validate_can_id("ecu1", "request_id", 0x1FFF_FFFF).is_ok());
         assert!(CanDiagGateway::validate_can_id("ecu1", "request_id", 0x2000_0000).is_err());
         assert!(CanDiagGateway::validate_can_id("ecu1", "request_id", u32::MAX).is_err());
+    }
+
+    #[test]
+    fn keepalive_payload_falls_back_to_uds_default() {
+        assert_eq!(
+            CanDiagGateway::resolve_keepalive_payload(Vec::new()),
+            vec![0x3E, 0x80]
+        );
+    }
+
+    #[test]
+    fn keepalive_payload_uses_com_param_as_is() {
+        // KWP2000 TesterPresent without response; must not be rewritten to
+        // the UDS suppress bit.
+        assert_eq!(
+            CanDiagGateway::resolve_keepalive_payload(vec![(
+                "kwpecu".to_owned(),
+                vec![0x3E, 0x02]
+            )]),
+            vec![0x3E, 0x02]
+        );
+    }
+
+    #[test]
+    fn keepalive_payload_conflict_picks_first_ecu_by_name() {
+        let candidates = vec![
+            ("zeta".to_owned(), vec![0x3E, 0x80]),
+            ("alpha".to_owned(), vec![0x3E, 0x02]),
+        ];
+        assert_eq!(
+            CanDiagGateway::resolve_keepalive_payload(candidates),
+            vec![0x3E, 0x02]
+        );
     }
 }

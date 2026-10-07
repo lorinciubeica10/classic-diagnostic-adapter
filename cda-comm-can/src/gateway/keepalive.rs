@@ -13,12 +13,16 @@
 
 //! Functional broadcast `TesterPresent` keep-alive for CAN bus.
 //!
-//! Periodically sends a UDS `TesterPresent` (`0x3E 0x80`) on the functional
-//! broadcast CAN ID to prevent all ECUs from going to sleep. The ID is
-//! derived from the MDD com-params (`CP_CanFuncReqId`) when available and
-//! defaults to `0x7DF` (ISO 15765-4). The sub-function `0x80` sets the
-//! `suppressPositiveResponse` bit so no ECU will reply, keeping the bus
-//! quiet.
+//! Periodically sends a `TesterPresent` on the functional broadcast CAN ID to
+//! prevent all ECUs from going to sleep. The ID is derived from the MDD
+//! com-params (`CP_CanFuncReqId`) when available and defaults to `0x7DF`
+//! (ISO 15765-4).
+//!
+//! The payload is taken as-is from the MDD com-params
+//! (`CP_TesterPresentMessage`) when available, so buses with KWP2000 ECUs can
+//! use e.g. `0x3E 0x02`. It defaults to the UDS `0x3E 0x80`, whose
+//! sub-function sets the `suppressPositiveResponse` bit so no ECU will reply,
+//! keeping the bus quiet.
 //!
 //! The interval comes from `can.keepalive_interval_ms`; `0` disables the
 //! broadcast for resident (on-board) deployments.
@@ -41,11 +45,13 @@ pub(crate) const DEFAULT_FUNCTIONAL_BROADCAST_ID: u32 = 0x7DF;
 pub(crate) const UNUSED_RX_ID_STANDARD: u32 = 0x7FF;
 pub(crate) const UNUSED_RX_ID_EXTENDED: u32 = 0x1FFF_FFFF;
 
-/// UDS `TesterPresent` with `suppressPositiveResponse`.
-const TESTER_PRESENT_PAYLOAD: [u8; 2] = [0x3E, 0x80];
+/// Default keep-alive payload, used when the MDD com-params do not define
+/// `CP_TesterPresentMessage`: UDS `TesterPresent` with
+/// `suppressPositiveResponse`.
+pub(crate) const DEFAULT_KEEPALIVE_PAYLOAD: [u8; 2] = [0x3E, 0x80];
 
 /// Starts a background task that periodically sends a functional-broadcast
-/// `TesterPresent` (`0x3E 0x80`) on the given CAN interface.
+/// `TesterPresent` (`payload`) on the given CAN interface.
 ///
 /// This keeps all ECUs on the bus awake without requiring individual
 /// physical addressing. The socket is opened once and reused across
@@ -56,6 +62,7 @@ const TESTER_PRESENT_PAYLOAD: [u8; 2] = [0x3E, 0x80];
 /// * `functional_id` - Functional broadcast CAN ID (from com-params), 11-bit
 ///   standard (e.g. `0x7DF`) or 29-bit extended (e.g. `0x18DB33F1`)
 /// * `interval` - How often to send the keep-alive
+/// * `payload` - `TesterPresent` request to send, as-is (from com-params)
 ///
 /// # Returns
 /// A [`BackgroundTask`] that stops the broadcast via
@@ -65,6 +72,7 @@ pub(crate) fn start_keepalive_broadcast(
     interface: String,
     functional_id: CanId,
     interval: Duration,
+    payload: Vec<u8>,
 ) -> BackgroundTask {
     let cancel = CancellationToken::new();
     let task_cancel = cancel.clone();
@@ -73,6 +81,7 @@ pub(crate) fn start_keepalive_broadcast(
             interface = %interface,
             interval_ms = u32::try_from(interval.as_millis()).unwrap_or(u32::MAX),
             broadcast_id = %functional_id,
+            payload = %hex::encode(&payload),
             "Starting functional broadcast TesterPresent keep-alive"
         );
 
@@ -120,7 +129,7 @@ pub(crate) fn start_keepalive_broadcast(
                     // Prefer shutdown when both arms are ready.
                     biased;
                     () = task_cancel.cancelled() => break,
-                    result = s.write_packet(&TESTER_PRESENT_PAYLOAD) => match result {
+                    result = s.write_packet(&payload) => match result {
                         Ok(()) => {
                             tracing::trace!(
                                 interface = %interface,
